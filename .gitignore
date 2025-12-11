@@ -63,5 +63,7 @@ ehthumbs.db
 *.tmp
 *.log
 
+data1/*.xlsx
+data2/
 *.xlsx
 
