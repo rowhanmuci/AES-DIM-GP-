@@ -1,0 +1,67 @@
+# ----------------------------
+# Python cache / temp files
+# ----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+
+# ----------------------------
+# Virtual environments
+# ----------------------------
+env/
+venv/
+.venv/
+
+# ----------------------------
+# Data folders (large datasets)
+# ----------------------------
+data/
+datasets/
+raw_data/
+processed_data/
+
+# ----------------------------
+# Training outputs / logs
+# ----------------------------
+logs/
+runs/
+outputs/
+checkpoints/
+weights/
+*.pth
+*.pt
+*.ckpt
+
+# ----------------------------
+# IDE / Editor settings
+# ----------------------------
+.vscode/
+.idea/
+
+# ----------------------------
+# OS-generated
+# ----------------------------
+Thumbs.db
+ehthumbs.db
+.DS_Store
+
+# ----------------------------
+# Shell scripts auto outputs
+# ----------------------------
+*.sh~
+
+# ----------------------------
+# Jupyter
+# ----------------------------
+.ipynb_checkpoints/
+
+# ----------------------------
+# Temporary files
+# ----------------------------
+*.tmp
+*.log
+
+
+
