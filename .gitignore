@@ -34,6 +34,8 @@ weights/
 *.pt
 *.ckpt
 
+*.csv
+
 # ----------------------------
 # IDE / Editor settings
 # ----------------------------
@@ -67,3 +69,4 @@ data1/*.xlsx
 data2/
 *.xlsx
 
+chart/
