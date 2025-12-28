@@ -425,7 +425,7 @@ def main_weighted_experiment():
     # ==========================================
     # Above
     # ==========================================
-    print("\n🔵 Above 50% Coverage\n")
+    print("\nbove 50% Coverage\n")
     
     train_above = pd.read_excel('data/train/Above.xlsx')
     test_above = pd.read_excel('data/test/Above.xlsx')
@@ -467,7 +467,7 @@ def main_weighted_experiment():
     # ==========================================
     # Below
     # ==========================================
-    print("\n🟢 Below 50% Coverage\n")
+    print("\nBelow 50% Coverage\n")
     
     train_below = pd.read_excel('data/train/Below.xlsx')
     test_below = pd.read_excel('data/test/Below.xlsx')
@@ -510,7 +510,7 @@ def main_weighted_experiment():
     # 比較
     # ==========================================
     print("\n" + "="*60)
-    print("📊 結果比較")
+    print("結果比較")
     print("="*60 + "\n")
     
     print("Baseline (組員):")
@@ -538,20 +538,20 @@ def main_weighted_experiment():
     mape_improvement = 8.63 - results_above['mape']
     
     if improvement > 0:
-        print(f"\n✅ 相比Phase 1改進:")
+        print(f"\n相比Phase 1改進:")
         print(f"  異常點: -{improvement} ({improvement/10*100:.1f}% reduction)")
         print(f"  MAPE: {mape_improvement:+.2f}%")
     elif improvement == 0:
-        print(f"\n😐 與Phase 1持平")
+        print(f"\n與Phase 1持平")
     else:
-        print(f"\n⚠️ 相比Phase 1退步: +{-improvement}個異常點")
+        print(f"\n相比Phase 1退步: +{-improvement}個異常點")
     
     print(f"\n{'='*60}\n")
     
     # 保存
     summary_df = pd.DataFrame(results_summary)
     summary_df.to_csv('phase2b_summary.csv', index=False)
-    print("✓ 結果已保存\n")
+    print("結果已保存\n")
     
     return {
         'above': (model_above, results_above, test_above_pred),
