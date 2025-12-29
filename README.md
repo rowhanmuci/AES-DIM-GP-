@@ -135,31 +135,21 @@ config = {
 │       ├── Above.xlsx          # Above測試資料
 │       └── Below.xlsx          # Below測試資料
 │
-├── phase1_corrected.py         # Phase 1: MAPE Loss
-├── phase1_improved_dkl.py      # Phase 1改進版
-├── Phase1_Corrected_README.md  # Phase 1說明
-│
-├── phase1_outlier_analysis.py  # 異常點分析工具
-├── analyze_tim_type3.py        # Type 3深度分析
+|── experiments/
+|   |   
+|   ├── phase1_corrected.py         # Phase 1: MAPE Loss
+|   ├── phase1_improved_dkl.py      # Phase 1改進版
+|   ├── phase2a_entity_embedding.py # Phase 2A: Entity Embedding
+|   │
+|   ├── phase1_outlier_analysis.py  # 異常點分析工具
+|   ├── analyze_tim_type3.py        # Type 3深度分析
 │
 ├── phase2a_entity_embedding.py # Phase 2A: Entity Embedding
-├── phase2a_embedding_fixed.py  # Phase 2A修正版 (MAPE fix)
-├── Entity_Embedding_Guide.md   # Embedding教學
-├── Phase2A_Analysis.md         # Phase 2A分析報告
-│
 ├── phase2b_sample_weighting.py # Phase 2B: 樣本加權
-├── phase2b_fixed_reproducible.py # Phase 2B修正版 (重現性)
-├── phase2b_seed_search.py      # 種子搜尋腳本
-├── Phase2B_Summary.md          # Phase 2B總結
-├── Phase2B_Final_Report.md     # Phase 2B最終報告
 │
-├── phase2b_multi_run.py        # 多次運行版本
-├── phase2c_optuna_search.py    # Optuna超參數搜尋
+├── phase2b_final.py # Phase 2B: 完整獨立版本 ⭐ 推薦
 │
-├── Improvement_Plan.md         # 改進計劃
-├── Instability_Analysis.md     # 穩定性分析
-│
-├── seed_search_results_fixed.csv # 種子搜尋結果
+├── phase2b_seed_search.py # 種子搜尋結果
 └── README.md                   # 本文件
 ```
 
