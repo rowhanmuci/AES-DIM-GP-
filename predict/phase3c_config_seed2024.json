@@ -1,0 +1,16 @@
+{
+  "embedding_dim": 7,
+  "hidden_dims": [
+    64,
+    32,
+    16
+  ],
+  "feature_dim": 13,
+  "dropout": 0.09491513149317164,
+  "lr": 0.008901416652770782,
+  "weight_decay": 0.00013759606945512584,
+  "mape_weight": 0.24715331849038266,
+  "sample_weight_factor": 2.7579956380781936,
+  "epochs": 500,
+  "patience": 50
+}

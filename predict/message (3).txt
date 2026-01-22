@@ -1,0 +1,375 @@
+"""
+Phase 2I: 對數尺度修正版 (Log-Scale Correction)
+策略:
+1. 回歸 Phase 2E 的權重設定 (6.0x)，這是 Combined 資料集表現最好的參數。
+2. 新增 'Log_Thickness' 特徵：
+   幫助模型更好地理解薄型樣本 (20um vs 40um) 的差異，
+   自然解決 Type 2 的誤差，而不需要過度加權。
+"""
+
+import pandas as pd
+import numpy as np
+import glob
+import os
+import random
+import gc
+import torch
+import torch.nn as nn
+import gpytorch
+import warnings
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, max_error
+
+# 設定顯示與運算環境
+warnings.filterwarnings('ignore')
+torch.set_default_dtype(torch.float64)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 工具函式
+# ==========================================
+def set_seed(seed=2024):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"✓ 隨機種子設定為: {seed}")
+
+def clear_gpu_cache():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def read_data_from_folder(folder_path, keyword):
+    search_path = os.path.join(folder_path, '*.xlsx')
+    files = glob.glob(search_path)
+    target_files = [f for f in files if keyword in os.path.basename(f)]
+    df_list = []
+    for f in target_files:
+        try:
+            df = pd.read_excel(f)
+            df['Source_File'] = os.path.basename(f)
+            df_list.append(df)
+        except Exception:
+            pass
+    if df_list:
+        return pd.concat(df_list, ignore_index=True)
+    return pd.DataFrame()
+
+# ==========================================
+# 1. 特徵工程 (Phase 2I: 解耦 + Log厚度)
+# ==========================================
+def feature_engineering_physics(df):
+    """
+    特徵工程 V4 (Phase 2I): 
+    1. 完全解耦物理通道 (Type 1/2/3 分離)
+    2. 新增 Log(Thickness) 幫助薄型樣本
+    """
+    df_feat = df.copy()
+    
+    if 'TIM_TYPE' in df_feat.columns:
+        df_feat['TIM_TYPE'] = df_feat['TIM_TYPE'].astype(float)
+    
+    epsilon = 1e-6
+    
+    # --- 新增: Log Thickness (全局特徵) ---
+    # 這能放大薄型樣本(20-40um)的特徵差異，幫助模型學習
+    df_feat['Log_Thickness'] = np.log1p(df_feat['TIM_THICKNESS'])
+    
+    # 原始物理量
+    inv_cov = 1.0 / (df_feat['TIM_COVERAGE'] + epsilon)
+    geo_fact = df_feat['TIM_THICKNESS'] / (df_feat['TIM_COVERAGE'] + epsilon)
+    
+    # 建立 One-Hot Masks
+    is_type1 = (df_feat['TIM_TYPE'] == 1).astype(float)
+    is_type2 = (df_feat['TIM_TYPE'] == 2).astype(float)
+    is_type3 = (df_feat['TIM_TYPE'] == 3).astype(float)
+    
+    # 獨立通道 (完全解耦)
+    df_feat['Inv_Cov_T1'] = inv_cov * is_type1
+    df_feat['Geo_T1']     = geo_fact * is_type1
+    
+    df_feat['Inv_Cov_T2'] = inv_cov * is_type2
+    df_feat['Geo_T2']     = geo_fact * is_type2
+    
+    df_feat['Inv_Cov_T3'] = inv_cov * is_type3
+    df_feat['Geo_T3']     = geo_fact * is_type3
+    
+    return df_feat
+
+# ==========================================
+# 2. 樣本加權策略 (回歸 6.0x)
+# ==========================================
+def compute_sample_weights(X_df, weight_factor=6.0):
+    """
+    計算樣本權重
+    回歸 Phase 2E 的設定，因為 9.0x 在混合資料集會破壞 Type 2 的預測。
+    """
+    weights = np.ones(len(X_df))
+    
+    tim_types = X_df['TIM_TYPE'].values
+    tim_coverages = X_df['TIM_COVERAGE'].values
+    tim_thicknesses = X_df['TIM_THICKNESS'].values
+    
+    # 困難樣本定義 (Type 3 + 高厚度)
+    difficult_mask = (
+        (tim_types == 3) &              
+        (tim_coverages >= 0.8) &        
+        (tim_thicknesses >= 200)        
+    )
+    
+    weights[difficult_mask] *= weight_factor
+    return weights, np.sum(difficult_mask)
+
+def weighted_mape_loss(y_pred, y_true, weights, epsilon=1e-8):
+    mape_per_sample = torch.abs((y_true - y_pred) / (torch.abs(y_true) + epsilon)) * 100
+    weighted_mape = torch.sum(mape_per_sample * weights) / torch.sum(weights)
+    return weighted_mape
+
+# ==========================================
+# 3. 模型定義 (維持不變)
+# ==========================================
+class DnnFeatureExtractor(nn.Module):
+    def __init__(self, input_dim, output_dim=8):
+        super(DnnFeatureExtractor, self).__init__()
+        self.structure = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(64, 32), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.Linear(32, output_dim)
+        )
+        self.output_dim = output_dim
+
+    def forward(self, x):
+        return self.structure(x)
+
+class ComplexDKLModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood, feature_extractor):
+        super(ComplexDKLModel, self).__init__(train_x, train_y, likelihood)
+        self.feature_extractor = feature_extractor
+        self.mean_module = gpytorch.means.ConstantMean()
+        
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=feature_extractor.output_dim)
+        ) + gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.LinearKernel()
+        )
+
+    def forward(self, x):
+        projected_x = self.feature_extractor(x)
+        mean_x = self.mean_module(projected_x)
+        covar_x = self.covar_module(projected_x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+# ==========================================
+# 4. 訓練流程
+# ==========================================
+def train_model(train_df, feature_cols, target_col, config):
+    
+    X_train_df = train_df[feature_cols]
+    X_train_np = X_train_df.values
+    y_train_np = train_df[target_col].values
+    
+    sample_weights_np, difficult_count = compute_sample_weights(train_df, config['sample_weight_factor'])
+    print(f"  困難樣本數: {difficult_count} (權重設定: {config['sample_weight_factor']}x)")
+    
+    scaler_x = StandardScaler()
+    X_train_scaled = scaler_x.fit_transform(X_train_np)
+    
+    scaler_y = StandardScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train_np.reshape(-1, 1)).flatten()
+    
+    train_x = torch.from_numpy(X_train_scaled).to(device)
+    train_y = torch.from_numpy(y_train_scaled).to(device)
+    sample_weights = torch.from_numpy(sample_weights_np).to(device)
+    
+    feature_extractor = DnnFeatureExtractor(input_dim=train_x.shape[1], output_dim=8).to(device)
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = ComplexDKLModel(train_x, train_y, likelihood, feature_extractor).to(device)
+    
+    optimizer = torch.optim.Adam([
+        {'params': model.feature_extractor.parameters(), 'lr': config['lr'], 'weight_decay': 1e-4},
+        {'params': model.covar_module.parameters()},
+        {'params': model.mean_module.parameters()},
+        {'params': model.likelihood.parameters()},
+    ], lr=config['lr'])
+    
+    # 維持 T0=60，增加學習細膩度
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=60, T_mult=2)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    
+    model.train()
+    likelihood.train()
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    best_state = None
+    
+    print("  開始訓練...")
+    for epoch in range(config['epochs']):
+        optimizer.zero_grad()
+        output = model(train_x)
+        
+        gp_loss = -mll(output, train_y)
+        mape = weighted_mape_loss(output.mean, train_y, sample_weights)
+        total_loss = gp_loss + config['mape_weight'] * mape
+        
+        total_loss.backward()
+        optimizer.step()
+        scheduler.step()
+        
+        curr_loss = total_loss.item()
+        
+        if curr_loss < best_loss:
+            best_loss = curr_loss
+            patience_counter = 0
+            best_state = {
+                'model': model.state_dict(),
+                'likelihood': likelihood.state_dict()
+            }
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= config['patience']:
+            break
+            
+    if best_state:
+        model.load_state_dict(best_state['model'])
+        likelihood.load_state_dict(best_state['likelihood'])
+        
+    return model, likelihood, scaler_x, scaler_y
+
+# ==========================================
+# 5. 評估流程
+# ==========================================
+def evaluate_model(model, likelihood, test_df, feature_cols, target_col, scaler_x, scaler_y):
+    model.eval()
+    likelihood.eval()
+    
+    X_test_np = test_df[feature_cols].values
+    y_test_np = test_df[target_col].values
+    
+    X_test_scaled = scaler_x.transform(X_test_np)
+    test_x = torch.from_numpy(X_test_scaled).to(device)
+    
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        pred_dist = likelihood(model(test_x))
+        y_pred_scaled = pred_dist.mean.cpu().numpy()
+        
+    y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    
+    errors = np.abs((y_test_np - y_pred) / y_test_np) * 100
+    mape = np.mean(errors)
+    mae = mean_absolute_error(y_test_np, y_pred)
+    max_err = max_error(y_test_np, y_pred)
+    
+    outliers_20 = np.sum(errors > 20)
+    
+    type3_mask = test_df['TIM_TYPE'] == 3
+    type3_outliers = np.sum((errors > 20) & type3_mask)
+    
+    print(f"\n  [評估結果]")
+    print(f"  MAPE      : {mape:.2f}%")
+    print(f"  MAE       : {mae:.4f}")
+    print(f"  Max Error : {max_err:.2f}%")
+    print(f"  異常點>20%: {outliers_20}/{len(y_test_np)} ({outliers_20/len(y_test_np)*100:.2f}%)")
+    
+    if np.sum(type3_mask) > 0:
+        print(f"  Type 3 異常: {type3_outliers}/{np.sum(type3_mask)}")
+        
+    if outliers_20 > 0:
+        print("\n  [嚴重異常樣本 (Top 10)]:")
+        bad_indices = np.where(errors > 20)[0]
+        # 簡單排序取前10
+        sorted_indices = bad_indices[np.argsort(errors[bad_indices])][::-1][:10]
+        
+        print(f"  {'Type':<6} {'Thick':<8} {'Cov':<6} {'True':<8} {'Pred':<8} {'Error%':<8}")
+        for idx in sorted_indices:
+            row = test_df.iloc[idx]
+            print(f"  {row['TIM_TYPE']:<6.0f} {row['TIM_THICKNESS']:<8.1f} {row['TIM_COVERAGE']:<6.1f} "
+                  f"{y_test_np[idx]:<8.2f} {y_pred[idx]:<8.2f} {errors[idx]:<8.2f}")
+
+# ==========================================
+# 主流程
+# ==========================================
+def run_pipeline(train_df, test_df, group_name):
+    print(f"\n{'='*60}")
+    print(f"執行實驗: {group_name} (Phase 2I - Log Scale)")
+    print(f"訓練筆數: {len(train_df)} | 測試筆數: {len(test_df)}")
+    print(f"{'='*60}")
+    
+    if train_df.empty or test_df.empty:
+        print("資料不足，跳過。")
+        return
+
+    # 1. 特徵工程
+    train_feat = feature_engineering_physics(train_df)
+    test_feat = feature_engineering_physics(test_df)
+    
+    target_col = 'Theta.JC'
+    ignore_cols = [target_col, 'Source_File', 'dataset_type', 'DNN', 'XGB', 'GP']
+    
+    feature_cols = [c for c in train_feat.columns if c not in ignore_cols]
+    feature_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(train_feat[c])]
+    
+    print(f"使用特徵: {feature_cols}")
+    
+    # 2. 設定參數 (回歸 6.0x)
+    config = {
+        'lr': 0.01,
+        'epochs': 600,
+        'patience': 50,
+        'mape_weight': 0.1,
+        'sample_weight_factor': 6.0 
+    }
+    
+    # 3. 訓練
+    model, likelihood, scaler_x, scaler_y = train_model(train_feat, feature_cols, target_col, config)
+    
+    # 4. 評估
+    evaluate_model(model, likelihood, test_feat, feature_cols, target_col, scaler_x, scaler_y)
+    
+    clear_gpu_cache()
+
+def main():
+    set_seed(2024)
+    print(f"目前使用的運算裝置: {device}")
+    
+    train_dir = 'data/train'
+    test_dir = 'data/test'
+    
+    if not os.path.exists(train_dir):
+        print(f"錯誤: 找不到 {train_dir}，請確認工作目錄。")
+        return
+
+    # 1. 讀取資料
+    print("正在讀取資料...")
+    df_train_above = read_data_from_folder(train_dir, 'Above')
+    df_train_below = read_data_from_folder(train_dir, 'Below')
+    df_test_above = read_data_from_folder(test_dir, 'Above')
+    df_test_below = read_data_from_folder(test_dir, 'Below')
+    
+    # 2. 分組實驗
+    run_pipeline(df_train_above, df_test_above, 'Above 50% Coverage')
+    run_pipeline(df_train_below, df_test_below, 'Below 50% Coverage')
+    
+    # 3. 混合實驗
+    print("\n>>> 混合訓練 (Combined)...")
+    if not df_train_above.empty and not df_train_below.empty:
+        df_train_mix = pd.concat([df_train_above, df_train_below], ignore_index=True)
+        test_dfs = []
+        if not df_test_above.empty: test_dfs.append(df_test_above)
+        if not df_test_below.empty: test_dfs.append(df_test_below)
+        
+        if test_dfs:
+            df_test_mix = pd.concat(test_dfs, ignore_index=True)
+            run_pipeline(df_train_mix, df_test_mix, 'Combined All Data')
+        else:
+            print("無測試資料，跳過混合實驗。")
+
+if __name__ == "__main__":
+    main()

@@ -1,11 +1,6 @@
 """
-Phase 2B 樣本加權 - 最終生產版本
-可設定隨機種子以確保可重現性
-
-使用方法:
-    python phase2b_final.py                    # 使用預設種子2024
-    python phase2b_final.py --seed 42          # 使用指定種子
-    python phase2b_final.py --seed 2024 -v     # 詳細模式
+Phase 4A - Spectral Mixture Kernel 實驗 (激進記憶體優化 v2)
+簡化誘導點初始化，避免 BatchNorm 問題
 """
 
 import pandas as pd
@@ -15,24 +10,22 @@ import torch.nn as nn
 import torch.optim as optim
 import gpytorch
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 import warnings
 import random
 import os
 import argparse
+import gc
 
 warnings.filterwarnings('ignore')
 
-torch.set_default_dtype(torch.float64)
+# 使用 float32 來節省記憶體
+torch.set_default_dtype(torch.float32)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_seed(seed):
-    """
-    設置隨機種子以確保完全可重現性
-    
-    Args:
-        seed: 隨機種子數值
-    """
+    """設置隨機種子以確保完全可重現性"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -41,7 +34,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
     print(f"✓ 隨機種子設定為: {seed}")
 
 
@@ -50,6 +42,7 @@ def clear_gpu_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    gc.collect()
 
 
 # ==========================================
@@ -57,9 +50,9 @@ def clear_gpu_cache():
 # ==========================================
 
 class DnnFeatureExtractor(nn.Module):
-    """深度神經網路特徵提取器"""
+    """輕量化特徵提取器 (專為 SM Kernel 設計)"""
     
-    def __init__(self, input_dim, hidden_dims=[64, 32, 16], output_dim=8, dropout=0.1):
+    def __init__(self, input_dim, hidden_dims=[32, 16], output_dim=4, dropout=0.05):
         super().__init__()
         
         layers = []
@@ -83,32 +76,82 @@ class DnnFeatureExtractor(nn.Module):
         return self.network(x)
 
 
-class GPRegressionModel(gpytorch.models.ExactGP):
-    """高斯過程回歸模型"""
+class VariationalSMGP(gpytorch.models.ApproximateGP):
+    """使用 SM Kernel 的 Variational GP"""
     
-    def __init__(self, train_x, train_y, likelihood, feature_extractor):
-        super().__init__(train_x, train_y, likelihood)
+    def __init__(self, inducing_points, feature_extractor, kernel_type='sm', num_mixtures=2):
+        """
+        Args:
+            inducing_points: 誘導點
+            feature_extractor: DNN 特徵提取器
+            kernel_type: 'sm', 'sm+rbf', 'sm+matern'
+            num_mixtures: SM 混合數 (1-3 推薦)
+        """
+        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
+            inducing_points.size(0)
+        )
+        variational_strategy = gpytorch.variational.VariationalStrategy(
+            self, inducing_points, variational_distribution, 
+            learn_inducing_locations=True
+        )
+        super().__init__(variational_strategy)
         
         self.feature_extractor = feature_extractor
         self.mean_module = gpytorch.means.ConstantMean()
+        self.kernel_type = kernel_type
         
-        
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(ard_num_dims=feature_extractor.output_dim)
-        )
-        '''
-        # 純 SM
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.SpectralMixtureKernel(
-                num_mixtures=2,
-                ard_num_dims=feature_extractor.output_dim
+        # 根據 kernel_type 建立不同的 kernel
+        if kernel_type == 'sm':
+            # 純 SM
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.SpectralMixtureKernel(
+                    num_mixtures=num_mixtures,
+                    ard_num_dims=feature_extractor.output_dim
+                )
             )
-        )
         
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feature_extractor.output_dim)
-        )
-        '''
+        elif kernel_type == 'sm+rbf':
+            # SM + RBF
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.SpectralMixtureKernel(
+                    num_mixtures=num_mixtures,
+                    ard_num_dims=feature_extractor.output_dim
+                ) + 
+                gpytorch.kernels.RBFKernel(ard_num_dims=feature_extractor.output_dim)
+            )
+        
+        elif kernel_type == 'sm+matern':
+            # SM + Matérn
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.SpectralMixtureKernel(
+                    num_mixtures=num_mixtures,
+                    ard_num_dims=feature_extractor.output_dim
+                ) + 
+                gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feature_extractor.output_dim)
+            )
+        
+        elif kernel_type == 'rbf':
+            # 純 RBF (對照組)
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=feature_extractor.output_dim)
+            )
+        
+        elif kernel_type == 'matern':
+            # 純 Matérn (對照組)
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feature_extractor.output_dim)
+            )
+        
+        elif kernel_type == 'rbf+matern':
+            # RBF + Matérn
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=feature_extractor.output_dim) +
+                gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feature_extractor.output_dim)
+            )
+        
+        else:
+            raise ValueError(f"Unknown kernel_type: {kernel_type}")
+    
     def forward(self, x):
         projected_x = self.feature_extractor(x)
         mean_x = self.mean_module(projected_x)
@@ -117,15 +160,11 @@ class GPRegressionModel(gpytorch.models.ExactGP):
 
 
 # ==========================================
-# 損失函數
+# 損失函數與權重
 # ==========================================
 
 def weighted_mape_loss(y_pred, y_true, weights, epsilon=1e-8):
-    """
-    加權MAPE損失函數
-    
-    注意: 在標準化空間計算（訓練時用）
-    """
+    """加權MAPE損失函數"""
     mape_per_sample = torch.abs((y_true - y_pred) / 
                                 (torch.abs(y_true) + epsilon)) * 100
     weighted_mape = torch.sum(mape_per_sample * weights) / torch.sum(weights)
@@ -133,18 +172,7 @@ def weighted_mape_loss(y_pred, y_true, weights, epsilon=1e-8):
 
 
 def compute_sample_weights(X, weight_factor=3.0):
-    """
-    計算樣本權重
-    
-    困難樣本定義: TIM_TYPE=3 AND Coverage=0.8 AND THICKNESS>=220
-    
-    Args:
-        X: 特徵矩陣 [TIM_TYPE, TIM_THICKNESS, TIM_COVERAGE]
-        weight_factor: 困難樣本的權重倍數
-        
-    Returns:
-        weights: 樣本權重數組
-    """
+    """計算樣本權重"""
     weights = np.ones(len(X))
     
     difficult_mask = (
@@ -163,27 +191,22 @@ def compute_sample_weights(X, weight_factor=3.0):
 # ==========================================
 
 def train_model(X_train, y_train, config, verbose=True):
-    """
-    訓練DKL模型
+    """訓練 Variational DKL 模型"""
     
-    Args:
-        X_train: 訓練特徵
-        y_train: 訓練標籤
-        config: 訓練配置
-        verbose: 是否顯示訓練過程
-        
-    Returns:
-        model, likelihood, scaler_x, scaler_y
-    """
     # 計算樣本權重
     sample_weights_np = compute_sample_weights(X_train, config['sample_weight_factor'])
     
     if verbose:
         difficult_count = np.sum(sample_weights_np > 1.0)
         print(f"\n計算樣本權重:")
-        print(f"  策略: Type 3 + Coverage 0.8 + THICKNESS>=220")
         print(f"  困難樣本數: {difficult_count} ({difficult_count/len(X_train)*100:.2f}%)")
         print(f"  權重倍數: {config['sample_weight_factor']}x")
+        print(f"  Kernel類型: {config['kernel_type']}")
+        if 'sm' in config['kernel_type']:
+            print(f"  SM Mixtures: {config['num_mixtures']}")
+        print(f"  誘導點數量: {config['num_inducing']}")
+        print(f"  Batch Size: {config['batch_size']}")
+        print(f"  資料型別: float32 (記憶體優化)")
     
     # 標準化
     scaler_x = StandardScaler()
@@ -192,11 +215,11 @@ def train_model(X_train, y_train, config, verbose=True):
     X_train_scaled = scaler_x.fit_transform(X_train)
     y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
     
-    train_x = torch.from_numpy(X_train_scaled).to(device)
-    train_y = torch.from_numpy(y_train_scaled).to(device)
-    sample_weights = torch.from_numpy(sample_weights_np).to(device)
+    train_x = torch.from_numpy(X_train_scaled).float().to(device)
+    train_y = torch.from_numpy(y_train_scaled).float().to(device)
+    sample_weights = torch.from_numpy(sample_weights_np).float().to(device)
     
-    # 建立模型
+    # 建立特徵提取器
     feature_extractor = DnnFeatureExtractor(
         input_dim=train_x.shape[1],
         hidden_dims=config['hidden_dims'],
@@ -204,19 +227,44 @@ def train_model(X_train, y_train, config, verbose=True):
         dropout=config['dropout']
     ).to(device)
     
+    # 選擇誘導點 (使用 k-means 在原始空間)
+    num_inducing = min(config['num_inducing'], len(train_x))
+    
+    if verbose:
+        print(f"\n初始化誘導點 (使用 k-means)...")
+    
+    # 在原始特徵空間做 k-means
+    kmeans = KMeans(n_clusters=num_inducing, random_state=config.get('seed', 2024), n_init=10)
+    kmeans.fit(X_train_scaled)
+    
+    # !!!關鍵修改：誘導點應該在輸入空間（標準化後的 X），不是特徵空間!!!
+    inducing_points = torch.from_numpy(kmeans.cluster_centers_).float().to(device)
+    
+    if verbose:
+        print(f"✓ 誘導點初始化完成 (shape: {inducing_points.shape})")
+    
+    # 建立模型
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = GPRegressionModel(train_x, train_y, likelihood, feature_extractor).to(device)
+    model = VariationalSMGP(
+        inducing_points, 
+        feature_extractor,
+        kernel_type=config['kernel_type'],
+        num_mixtures=config.get('num_mixtures', 2)
+    ).to(device)
     
     # 優化器
     optimizer = optim.Adam([
         {'params': model.feature_extractor.parameters(), 'lr': config['lr'], 'weight_decay': 1e-4},
-        {'params': model.covar_module.parameters()},
+        {'params': model.variational_parameters(), 'lr': config['lr'] * 0.5},
+        {'params': model.covar_module.parameters(), 'lr': config['lr'] * 0.1},
         {'params': model.mean_module.parameters()},
-        {'params': model.likelihood.parameters()},
+        {'params': likelihood.parameters()},
     ], lr=config['lr'])
     
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    
+    # Variational ELBO
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=len(train_y))
     
     # 訓練
     if verbose:
@@ -227,32 +275,74 @@ def train_model(X_train, y_train, config, verbose=True):
     
     best_loss = float('inf')
     patience_counter = 0
+    batch_size = config['batch_size']
+    n_batches = (len(train_x) + batch_size - 1) // batch_size
     
-    import time
-    start_time = time.time()
-
     for epoch in range(config['epochs']):
-        optimizer.zero_grad()
+        epoch_loss = 0.0
+        epoch_elbo = 0.0
+        epoch_mape = 0.0
         
-        output = model(train_x)
-        gp_loss = -mll(output, train_y)
-        mape = weighted_mape_loss(output.mean, train_y, sample_weights)
-        total_loss = gp_loss + config['mape_weight'] * mape
+        # Mini-batch 訓練
+        indices_perm = torch.randperm(len(train_x))
         
-        total_loss.backward()
-        optimizer.step()
+        for i in range(n_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, len(train_x))
+            batch_indices = indices_perm[start_idx:end_idx]
+            
+            batch_x = train_x[batch_indices]
+            batch_y = train_y[batch_indices]
+            batch_weights = sample_weights[batch_indices]
+            
+            optimizer.zero_grad()
+            
+            # 前向傳播
+            output = model(batch_x)
+            
+            # ELBO loss
+            elbo_loss = -mll(output, batch_y)
+            
+            # MAPE loss
+            mape = weighted_mape_loss(output.mean, batch_y, batch_weights)
+            
+            # 總損失
+            total_loss = elbo_loss + config['mape_weight'] * mape
+            
+            # 反向傳播
+            total_loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            epoch_loss += total_loss.item()
+            epoch_elbo += elbo_loss.item()
+            epoch_mape += mape.item()
+            
+            # 清理記憶體
+            del output, elbo_loss, mape, total_loss
+            
+            # 每個 batch 都清理一次
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         scheduler.step()
         
-        current_loss = total_loss.item()
+        # 平均損失
+        avg_loss = epoch_loss / n_batches
+        avg_elbo = epoch_elbo / n_batches
+        avg_mape = epoch_mape / n_batches
         
         # 顯示訓練進度
-        if verbose and (epoch + 1) % 100 == 0:
-            print(f"Epoch {epoch+1}: GP Loss={gp_loss.item():.4f}, "
-                  f"MAPE={mape.item():.2f}%, Total={total_loss.item():.4f}")
+        if verbose and (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1}: ELBO={avg_elbo:.4f}, "
+                  f"MAPE={avg_mape:.2f}%, Total={avg_loss:.4f}")
         
         # Early stopping
-        if current_loss < best_loss:
-            best_loss = current_loss
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             patience_counter = 0
             best_state = {
                 'model': model.state_dict(),
@@ -273,29 +363,18 @@ def train_model(X_train, y_train, config, verbose=True):
     if verbose:
         print(f"訓練完成 (Final Loss: {best_loss:.4f})")
     
+    clear_gpu_cache()
+    
     return model, likelihood, scaler_x, scaler_y
 
 
 def evaluate_model(model, likelihood, X_test, y_test, scaler_x, scaler_y, verbose=True):
-    """
-    評估模型
-    
-    Args:
-        model: 訓練好的模型
-        likelihood: Likelihood
-        X_test: 測試特徵
-        y_test: 測試標籤
-        scaler_x, scaler_y: 標準化器
-        verbose: 是否顯示評估結果
-        
-    Returns:
-        results: 包含MAPE, outliers等指標的字典
-    """
+    """評估模型"""
     model.eval()
     likelihood.eval()
     
     X_test_scaled = scaler_x.transform(X_test)
-    test_x = torch.from_numpy(X_test_scaled).to(device)
+    test_x = torch.from_numpy(X_test_scaled).float().to(device)
     
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         pred_dist = likelihood(model(test_x))
@@ -306,7 +385,7 @@ def evaluate_model(model, likelihood, X_test, y_test, scaler_x, scaler_y, verbos
     y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
     y_std = y_std_scaled * scaler_y.scale_[0]
     
-    # 計算指標 (在原始空間)
+    # 計算指標
     relative_errors = np.abs((y_test - y_pred) / y_test) * 100
     
     mape = np.mean(relative_errors)
@@ -374,44 +453,45 @@ def save_predictions(X_test, y_test, results, filename):
 # 主函數
 # ==========================================
 
-def main(seed=6000, verbose=True):
-    """
-    主訓練流程
+def main(seed=2024, kernel_type='sm', num_mixtures=2, verbose=True):
+    """主訓練流程"""
     
-    Args:
-        seed: 隨機種子
-        verbose: 是否顯示詳細信息
-    """
-    # 設置隨機種子和清空GPU
     clear_gpu_cache()
     set_seed(seed)
     
     print(f"\n使用裝置: {device}\n")
     
     print("="*60)
-    print("Phase 2B: 樣本加權 (Sample Weighting) - 最終版本")
+    print(f"Phase 4A: SM Kernel 實驗 (激進記憶體優化 v2)")
+    print(f"Kernel: {kernel_type}")
     print("="*60)
     
     # 特徵和目標
     feature_cols = ['TIM_TYPE', 'TIM_THICKNESS', 'TIM_COVERAGE']
     target_col = 'Theta.JC'
     
-    # 配置（最佳參數）
+    # 配置 (激進記憶體優化)
     config = {
-        'hidden_dims': [64, 32, 16],
-        'feature_dim': 8,
-        'dropout': 0.1,
+        'hidden_dims': [32, 16],       # 小網路
+        'feature_dim': 4,               # 小特徵維度
+        'dropout': 0.05,
         'lr': 0.01,
         'epochs': 500,
         'patience': 50,
         'mape_weight': 0.1,
         'sample_weight_factor': 3.0,
+        'kernel_type': kernel_type,
+        'num_mixtures': num_mixtures,
+        'batch_size': 128,              # 小 batch
+        'num_inducing': 256,            # 少量誘導點
+        'seed': seed,
     }
     
     if verbose:
         print(f"\n配置:")
         for key, value in config.items():
-            print(f"  {key}: {value}")
+            if key != 'seed':
+                print(f"  {key}: {value}")
     
     # ==========================================
     # Above Dataset
@@ -419,21 +499,18 @@ def main(seed=6000, verbose=True):
     
     print(f"\n\n{'🔵 Above 50% Coverage'}\n")
     
-    # 載入資料
     train_above = pd.read_excel('data/train/Above.xlsx')
     test_above = pd.read_excel('data/test/Above.xlsx')
     
-    
-    # 訓練集清理（去除重複，取平均）
     train_above_clean = train_above.groupby(feature_cols, as_index=False).agg({
         target_col: 'mean'
     })
-   
-    print(f"訓練集: {len(train_above)} 筆")
+    
+    print(f"訓練集: {len(train_above_clean)} 筆")
     print(f"測試集: {len(test_above)} 筆")
     
-    X_train_above = train_above[feature_cols].values
-    y_train_above = train_above[target_col].values
+    X_train_above = train_above_clean[feature_cols].values
+    y_train_above = train_above_clean[target_col].values
     
     X_test_above = test_above[feature_cols].values
     y_test_above = test_above[target_col].values
@@ -453,7 +530,9 @@ def main(seed=6000, verbose=True):
     
     # 保存預測結果
     save_predictions(X_test_above, y_test_above, results_above, 
-                     f'phase2b_final_above_seed{seed}_predictions.csv')
+                     f'phase4a_{kernel_type}_m{num_mixtures}_above_seed{seed}_predictions.csv')
+    
+    clear_gpu_cache()
     
     # ==========================================
     # Below Dataset
@@ -461,11 +540,9 @@ def main(seed=6000, verbose=True):
     
     print(f"\n\n{'🔵 Below 50% Coverage'}\n")
     
-    # 載入資料
     train_below = pd.read_excel('data/train/Below.xlsx')
     test_below = pd.read_excel('data/test/Below.xlsx')
     
-    # 訓練集清理
     train_below_clean = train_below.groupby(feature_cols, as_index=False).agg({
         target_col: 'mean'
     })
@@ -494,16 +571,19 @@ def main(seed=6000, verbose=True):
     
     # 保存預測結果
     save_predictions(X_test_below, y_test_below, results_below,
-                     f'phase2b_final_below_seed{seed}_predictions.csv')
+                     f'phase4a_{kernel_type}_m{num_mixtures}_below_seed{seed}_predictions.csv')
     
     # ==========================================
     # 總結
     # ==========================================
     
     print("\n" + "="*60)
-    print("最終結果總結")
+    print(f"Phase 4A 結果總結 - Kernel: {kernel_type}")
+    if 'sm' in kernel_type:
+        print(f"Mixtures: {num_mixtures}")
     print("="*60)
     print(f"隨機種子: {seed}")
+    
     print(f"\nAbove資料集:")
     print(f"  異常點 (>20%): {results_above['outliers_20']}/{len(y_test_above)} ({results_above['outliers_20']/len(y_test_above)*100:.2f}%)")
     print(f"  MAPE: {results_above['mape']:.2f}%")
@@ -520,19 +600,33 @@ def main(seed=6000, verbose=True):
     return {
         'above': results_above,
         'below': results_below,
+        'kernel_type': kernel_type,
         'seed': seed
     }
 
 
 if __name__ == "__main__":
-    # 命令行參數解析
-    parser = argparse.ArgumentParser(description='Phase 2B 樣本加權 - 最終版本')
-    parser.add_argument('--seed', type=int, default=2024, 
-                        help='隨機種子 (預設: 2024)')
-    parser.add_argument('-v', '--verbose', action='store_true', 
-                        help='顯示詳細訓練過程')
+    parser = argparse.ArgumentParser(description='Phase 4A - SM Kernel 實驗')
+    parser.add_argument('--seed', type=int, default=2024, help='隨機種子')
+    parser.add_argument('--kernel', type=str, default='sm', 
+                        choices=['sm', 'sm+rbf', 'sm+matern', 'rbf', 'matern', 'rbf+matern'],
+                        help='Kernel類型')
+    parser.add_argument('--mixtures', type=int, default=2, 
+                        help='SM mixtures 數量 (1-3 推薦)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='顯示詳細訓練過程')
     
     args = parser.parse_args()
     
-    # 運行訓練
-    results = main(seed=args.seed, verbose=args.verbose)
+    results = main(
+        seed=args.seed,
+        kernel_type=args.kernel,
+        num_mixtures=args.mixtures,
+        verbose=args.verbose
+    )
+    
+    print("\n💡 使用範例:")
+    print("  python phase4a_sm_kernel.py --kernel sm --mixtures 2 -v         # 純 SM (2 mixtures)")
+    print("  python phase4a_sm_kernel.py --kernel sm --mixtures 3 -v         # 純 SM (3 mixtures)")
+    print("  python phase4a_sm_kernel.py --kernel sm+rbf --mixtures 2 -v     # SM + RBF")
+    print("  python phase4a_sm_kernel.py --kernel sm+matern --mixtures 2 -v  # SM + Matérn")
+    print("  python phase4a_sm_kernel.py --kernel rbf+matern -v              # RBF + Matérn (對照)\n")

@@ -5,4 +5,7 @@ data/
 *.csv
 .vscode/
 .idea/
+*.png
+*.jpg
+*.jpeg
 
