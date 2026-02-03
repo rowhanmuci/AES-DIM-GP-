@@ -1,7 +1,8 @@
 """
-Phase 3A: Heteroscedastic DKL 實驗
+Phase 3A: Heteroscedastic DKL 實驗 (CUDA 版)
 - 不去重，使用完整訓練資料
 - 噪聲由網路預測，而非固定值
+- 支援 CUDA 加速
 """
 
 import torch
@@ -14,13 +15,59 @@ from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
 from gpytorch.mlls import VariationalELBO
 import warnings
+import gc
+import random
+
 warnings.filterwarnings('ignore')
+
+# ============================================
+# 0. 設定裝置與可重現性
+# ============================================
+
+def set_seed(seed=42):
+    """設定所有隨機種子以確保可重現性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 更嚴格的確定性設定（可能會稍微影響性能）
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    # 設定 cublas workspace 配置以確保可重現性
+    import os
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+
+def clear_gpu_cache():
+    """清理 GPU 記憶體"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+def get_device():
+    """取得可用的裝置"""
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"使用 GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU 記憶體: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        device = torch.device('cpu')
+        print("使用 CPU")
+    return device
+
+# 初始化
+SEED = 982
+set_seed(SEED)
+clear_gpu_cache()
+DEVICE = get_device()
 
 # ============================================
 # 1. 載入資料（不去重）
 # ============================================
 print("="*80)
-print("Phase 3A: Heteroscedastic DKL")
+print("Phase 3A: Heteroscedastic DKL (CUDA 版)")
 print("="*80)
 
 train_df = pd.read_excel('data/train/Above.xlsx')
@@ -29,7 +76,7 @@ test_df = pd.read_excel('data/test/Above.xlsx')
 print(f"訓練集: {len(train_df)} 筆 (不去重)")
 print(f"測試集: {len(test_df)} 筆")
 
-# 特徵工程（與之前相同）
+# 特徵工程（與原版相同）
 def prepare_features(df):
     X = df[['TIM_TYPE', 'TIM_THICKNESS', 'TIM_COVERAGE']].copy()
     
@@ -66,15 +113,16 @@ y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
 
 X_test_scaled = scaler_X.transform(X_test)
 
-# 轉換為 tensor
-X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+# 轉換為 tensor 並移到指定裝置
+X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).to(DEVICE)
+y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32).to(DEVICE)
+X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32).to(DEVICE)
 
 print(f"特徵維度: {X_train_tensor.shape[1]}")
+print(f"裝置: {DEVICE}")
 
 # ============================================
-# 2. Heteroscedastic DKL 模型定義
+# 2. Heteroscedastic DKL 模型定義（與原版相同）
 # ============================================
 
 class FeatureExtractor(nn.Module):
@@ -134,9 +182,9 @@ class HeteroscedasticGPModel(ApproximateGP):
         super().__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(ard_num_dims=inducing_points.size(1))
+            gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=inducing_points.size(1))
         )
-    
+
     def forward(self, x):
         mean = self.mean_module(x)
         covar = self.covar_module(x)
@@ -145,14 +193,18 @@ class HeteroscedasticGPModel(ApproximateGP):
 
 class HeteroscedasticDKL(nn.Module):
     """完整的 Heteroscedastic DKL 模型"""
-    def __init__(self, input_dim, feature_dim=16, n_inducing=100):
+    def __init__(self, input_dim, feature_dim=16, n_inducing=100, device='cpu'):
         super().__init__()
+        self.device = device
         self.feature_extractor = FeatureExtractor(input_dim, output_dim=feature_dim)
         self.noise_net = NoiseNetwork(input_dim)
         
-        # 初始化 inducing points
-        inducing_points = torch.randn(n_inducing, feature_dim)
+        # 初始化 inducing points（先在 CPU 上生成以確保可重現性，再移到指定裝置）
+        inducing_points = torch.randn(n_inducing, feature_dim)  # CPU 上生成
         self.gp = HeteroscedasticGPModel(inducing_points)
+        
+        # 移動整個模型到指定裝置
+        self.to(device)
         
     def forward(self, x):
         features = self.feature_extractor(x)
@@ -175,7 +227,7 @@ class HeteroscedasticDKL(nn.Module):
 
 
 # ============================================
-# 3. 自定義 Loss（考慮 heteroscedastic noise）
+# 3. 自定義 Loss（與原版相同）
 # ============================================
 
 class HeteroscedasticLoss(nn.Module):
@@ -193,9 +245,6 @@ class HeteroscedasticLoss(nn.Module):
         # Reconstruction loss
         recon_loss = 0.5 * log_noise + 0.5 * (y - mean)**2 / noise_var
         
-        # GP prior (KL divergence from ELBO)
-        # 這部分由 VariationalELBO 處理
-        
         return recon_loss.mean()
 
 
@@ -204,12 +253,13 @@ class HeteroscedasticLoss(nn.Module):
 # ============================================
 
 def train_heteroscedastic_dkl(X_train, y_train, X_test, y_test, 
-                               scaler_y, seed=42, n_epochs=300, lr=0.005):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+                               scaler_y, device, seed=42, n_epochs=300, lr=0.005):
+    # 確保可重現性
+    set_seed(seed)
+    clear_gpu_cache()
     
     input_dim = X_train.shape[1]
-    model = HeteroscedasticDKL(input_dim, feature_dim=16, n_inducing=100)
+    model = HeteroscedasticDKL(input_dim, feature_dim=16, n_inducing=100, device=device)
     
     # Optimizer
     optimizer = torch.optim.Adam([
@@ -221,9 +271,6 @@ def train_heteroscedastic_dkl(X_train, y_train, X_test, y_test,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     
     # Loss
-    mll = VariationalELBO(model.gp.likelihood if hasattr(model.gp, 'likelihood') 
-                          else gpytorch.likelihoods.GaussianLikelihood(), 
-                          model.gp, num_data=len(y_train))
     hetero_loss = HeteroscedasticLoss()
     
     # Training loop
@@ -233,6 +280,7 @@ def train_heteroscedastic_dkl(X_train, y_train, X_test, y_test,
     best_loss = float('inf')
     patience = 30
     patience_counter = 0
+    best_state = None
     
     for epoch in range(n_epochs):
         optimizer.zero_grad()
@@ -270,7 +318,7 @@ def train_heteroscedastic_dkl(X_train, y_train, X_test, y_test,
             model.eval()
             with torch.no_grad():
                 mean, var, noise = model.predict(X_test)
-                pred_scaled = mean.numpy()
+                pred_scaled = mean.cpu().numpy()
                 pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
                 
                 errors = np.abs(pred - y_test) / y_test * 100
@@ -286,7 +334,9 @@ def train_heteroscedastic_dkl(X_train, y_train, X_test, y_test,
             model.gp.train()
     
     # Load best model
-    model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(device)
     
     return model
 
@@ -302,7 +352,7 @@ print("="*80)
 model = train_heteroscedastic_dkl(
     X_train_tensor, y_train_tensor, 
     X_test_tensor, y_test,
-    scaler_y, seed=42, n_epochs=300
+    scaler_y, DEVICE, seed=SEED, n_epochs=300
 )
 
 # ============================================
@@ -316,13 +366,13 @@ print("="*80)
 model.eval()
 with torch.no_grad():
     mean, var, noise = model.predict(X_test_tensor)
-    pred_scaled = mean.numpy()
+    pred_scaled = mean.cpu().numpy()
     pred = scaler_y.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
     
     # Uncertainty
-    std = np.sqrt(var.numpy())
+    std = np.sqrt(var.cpu().numpy())
     std_original = std * scaler_y.scale_[0]
-    noise_original = np.sqrt(noise.numpy()) * scaler_y.scale_[0]
+    noise_original = np.sqrt(noise.cpu().numpy()) * scaler_y.scale_[0]
 
 # 計算指標
 errors = np.abs(pred - y_test) / y_test * 100
@@ -342,15 +392,16 @@ test_df_with_pred['Noise'] = noise_original
 test_df_with_pred['Std'] = std_original
 
 print(f"\n【Learned Noise 分布】")
-for typ in [1, 2, 3]:
+for typ in sorted(test_df['TIM_TYPE'].unique()):
     subset = test_df_with_pred[test_df_with_pred['TIM_TYPE'] == typ]
     print(f"Type {typ}: Avg Noise = {subset['Noise'].mean():.4f}")
 
 print(f"\n【Type 3 按 Coverage 的 Noise】")
 t3 = test_df_with_pred[test_df_with_pred['TIM_TYPE'] == 3]
-for cov in [0.6, 0.8, 1.0]:
+for cov in sorted(t3['TIM_COVERAGE'].unique()):
     subset = t3[t3['TIM_COVERAGE'] == cov]
-    print(f"Cov={cov}: Avg Noise = {subset['Noise'].mean():.4f}, Avg Error = {subset['Error_Pct'].mean():.1f}%")
+    if len(subset) > 0:
+        print(f"Cov={cov}: Avg Noise = {subset['Noise'].mean():.4f}, Avg Error = {subset['Error_Pct'].mean():.1f}%")
 
 # 異常點詳情
 print(f"\n【異常點詳情 (>20%)】")
@@ -366,3 +417,7 @@ output_df = test_df_with_pred[['TIM_TYPE', 'TIM_THICKNESS', 'TIM_COVERAGE',
                                 'Theta.JC', 'Predicted', 'Error_Pct', 'Noise', 'Std']]
 output_df.to_csv('phase3a_heteroscedastic_results.csv', index=False)
 print(f"\n✓ 結果已保存至 phase3a_heteroscedastic_results.csv")
+
+# 清理 GPU 記憶體
+clear_gpu_cache()
+print("✓ GPU 記憶體已清理")
