@@ -1,0 +1,15 @@
+{
+  "best_by_min_max_error": {
+    "seed": 49,
+    "MaxError": 720.4244077205658,
+    "MAPE": 117.25353892791763,
+    "Outliers20": 114
+  },
+  "best_by_min_outliers20": {
+    "seed": 1,
+    "Outliers20": 114,
+    "MaxError": 723.6152678728104,
+    "MAPE": 117.79858447601178
+  },
+  "results_csv": "D:\\NSYSU\\AES\\test_seed_sweep.csv"
+}
